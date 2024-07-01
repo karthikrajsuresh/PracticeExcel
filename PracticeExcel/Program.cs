@@ -2,9 +2,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
 using PracticeExcel.Data;
 using OfficeOpenXml;
-using System.Data.SqlClient;
-using ClosedXML.Excel;
 using PracticeExcel.ObjectLifeCycleExample;
+using Microsoft.Extensions.Caching.Distributed;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -23,6 +22,12 @@ builder.Services.AddDbContext<Race>(options =>
 builder.Services.AddScoped<ExcelService>();
 builder.Services.AddScoped<DatabaseToExcelExporter>();
 
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = builder.Configuration.GetConnectionString("RedisConnection");
+    options.InstanceName = "SampleInstance";
+});
+
 var app = builder.Build();
 
 if (app.Environment.IsDevelopment())
@@ -34,15 +39,27 @@ if (app.Environment.IsDevelopment())
 app.UseHttpsRedirection();
 app.UseAuthorization();
 
-app.MapGet("/export-to-excel", async (DatabaseToExcelExporter exporter, IConfiguration config) =>
+app.MapGet("/export-to-excel", async (DatabaseToExcelExporter exporter, IConfiguration config, IDistributedCache cache) =>
 {
-    string connectionString = config.GetConnectionString("PracticeConnectionString");
-    string outputPath = Path.Combine(Path.GetTempPath(), $"export_{Guid.NewGuid()}.xlsx");
+    string cacheKey = "ExcelExport";
+    byte[] fileBytes;
 
-    await Task.Run(() => exporter.ExportData(connectionString, outputPath));
+    fileBytes = await cache.GetAsync(cacheKey);
 
-    byte[] fileBytes = await File.ReadAllBytesAsync(outputPath);
-    File.Delete(outputPath);
+    if (fileBytes == null)
+    {
+        string connectionString = config.GetConnectionString("PracticeConnectionString");
+        string outputPath = Path.Combine(Path.GetTempPath(), $"export_{Guid.NewGuid()}.xlsx");
+
+        await Task.Run(() => exporter.ExportData(connectionString, outputPath));
+
+        fileBytes = await File.ReadAllBytesAsync(outputPath);
+        File.Delete(outputPath);
+
+        var cacheEntryOptions = new DistributedCacheEntryOptions()
+            .SetSlidingExpiration(TimeSpan.FromSeconds(15));
+        await cache.SetAsync(cacheKey, fileBytes, cacheEntryOptions);
+    }
 
     return Results.File(fileBytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "export.xlsx");
 });
